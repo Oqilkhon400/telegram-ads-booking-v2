@@ -12,11 +12,28 @@ if (!isset($_SESSION['user_id']) || $_SESSION['role'] !== 'superadmin') {
     exit;
 }
 
-// Sana filtrlari
+// Logging function for statistics
+function log_statistics_issue($message, $data = []) {
+    $log_message = date('Y-m-d H:i:s') . " - STATISTICS: $message";
+    if (!empty($data)) {
+        $log_message .= " | Data: " . json_encode($data);
+    }
+    error_log($log_message);
+}
+
+// Sana filtrlari with validation
 $date_from = isset($_GET['date_from']) ? $_GET['date_from'] : date('Y-m-01');
 $date_to = isset($_GET['date_to']) ? $_GET['date_to'] : date('Y-m-d');
 
-// Umumiy statistika
+// Validate dates
+if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date_from) || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $date_to)) {
+    log_statistics_issue('Invalid date format', ['date_from' => $date_from, 'date_to' => $date_to]);
+    $date_from = date('Y-m-01');
+    $date_to = date('Y-m-d');
+}
+
+// Umumiy statistika with parameterized query
+// Consider both payment_date (when payment was made) and created_at (when record was created)
 $stats_query = "
     SELECT 
         (SELECT COUNT(*) FROM customers WHERE is_active = 1) as active_customers,
@@ -24,37 +41,97 @@ $stats_query = "
         (SELECT COUNT(*) FROM customer_packages WHERE status = 'active') as active_packages,
         (SELECT COUNT(*) FROM bookings WHERE status = 'scheduled') as scheduled_ads,
         (SELECT COUNT(*) FROM bookings WHERE status = 'published') as published_ads,
-        (SELECT SUM(amount) FROM payments WHERE payment_date BETWEEN '$date_from' AND '$date_to') as total_revenue,
-        (SELECT COUNT(*) FROM payments WHERE payment_date BETWEEN '$date_from' AND '$date_to') as total_payments
+        (SELECT SUM(amount) FROM payments 
+         WHERE (payment_date BETWEEN ? AND ?) 
+         OR (DATE(created_at) BETWEEN ? AND ?)) as total_revenue,
+        (SELECT COUNT(*) FROM payments 
+         WHERE (payment_date BETWEEN ? AND ?) 
+         OR (DATE(created_at) BETWEEN ? AND ?)) as total_payments
 ";
-$stats_result = $conn->query($stats_query);
-$stats = $stats_result->fetch_assoc();
 
-// Oylik daromad (oxirgi 6 oy)
-$monthly_revenue = [];
+$stmt = $conn->prepare($stats_query);
+if (!$stmt) {
+    log_statistics_issue('Failed to prepare stats query', ['error' => $conn->error]);
+    die('Database error occurred');
+}
+
+$stmt->bind_param('ssssssss', $date_from, $date_to, $date_from, $date_to, $date_from, $date_to, $date_from, $date_to);
+$stmt->execute();
+$stats_result = $stmt->get_result();
+$stats = $stats_result->fetch_assoc();
+$stmt->close();
+
+// Log if no revenue found in the period
+if ($stats['total_revenue'] === null || $stats['total_revenue'] == 0) {
+    log_statistics_issue('No revenue found for period', ['date_from' => $date_from, 'date_to' => $date_to]);
+}
+
+// Oylik daromad (oxirgi 6 oy) - OPTIMIZED: Single query instead of 6 separate queries
+$month_name_map = [
+    'Jan' => 'Yan', 'Feb' => 'Fev', 'Mar' => 'Mar', 'Apr' => 'Apr',
+    'May' => 'May', 'Jun' => 'Iyun', 'Jul' => 'Iyul', 'Aug' => 'Avg',
+    'Sep' => 'Sen', 'Oct' => 'Okt', 'Nov' => 'Noy', 'Dec' => 'Dek'
+];
+
+// Build list of months for query
+$months_to_query = [];
 for ($i = 5; $i >= 0; $i--) {
-    $month = date('Y-m', strtotime("-$i months"));
-    $month_name_map = [
-        'Jan' => 'Yan', 'Feb' => 'Fev', 'Mar' => 'Mar', 'Apr' => 'Apr',
-        'May' => 'May', 'Jun' => 'Iyun', 'Jul' => 'Iyul', 'Aug' => 'Avg',
-        'Sep' => 'Sen', 'Oct' => 'Okt', 'Nov' => 'Noy', 'Dec' => 'Dek'
-    ];
-    $month_name_en = date('M', strtotime("-$i months"));
+    $months_to_query[] = date('Y-m', strtotime("-$i months"));
+}
+
+// Single optimized query for all months
+$revenue_query = "
+    SELECT 
+        DATE_FORMAT(payment_date, '%Y-%m') as month_key,
+        DATE_FORMAT(created_at, '%Y-%m') as created_month,
+        COALESCE(SUM(amount), 0) as revenue
+    FROM payments 
+    WHERE DATE_FORMAT(payment_date, '%Y-%m') >= ? 
+       OR DATE_FORMAT(created_at, '%Y-%m') >= ?
+    GROUP BY COALESCE(DATE_FORMAT(payment_date, '%Y-%m'), DATE_FORMAT(created_at, '%Y-%m'))
+    ORDER BY month_key ASC
+";
+
+$earliest_month = $months_to_query[0];
+$stmt = $conn->prepare($revenue_query);
+if (!$stmt) {
+    log_statistics_issue('Failed to prepare revenue query', ['error' => $conn->error]);
+}
+$stmt->bind_param('ss', $earliest_month, $earliest_month);
+$stmt->execute();
+$revenue_result = $stmt->get_result();
+
+// Organize results by month
+$revenue_by_month = [];
+while ($row = $revenue_result->fetch_assoc()) {
+    $month = $row['month_key'] ?: $row['created_month'];
+    if (!isset($revenue_by_month[$month])) {
+        $revenue_by_month[$month] = 0;
+    }
+    $revenue_by_month[$month] += $row['revenue'];
+}
+$stmt->close();
+
+// Build final array with all months (including those with zero revenue)
+$monthly_revenue = [];
+foreach ($months_to_query as $month) {
+    $month_name_en = date('M', strtotime($month . '-01'));
     $month_name = $month_name_map[$month_name_en] ?? $month_name_en;
     
-    $revenue_query = "SELECT COALESCE(SUM(amount), 0) as revenue 
-                      FROM payments 
-                      WHERE DATE_FORMAT(payment_date, '%Y-%m') = '$month'";
-    $revenue_result = $conn->query($revenue_query);
-    $revenue_data = $revenue_result->fetch_assoc();
+    $revenue = isset($revenue_by_month[$month]) ? $revenue_by_month[$month] : 0;
+    
+    // Log if missing revenue data for a month
+    if ($revenue == 0) {
+        log_statistics_issue('Zero revenue for month', ['month' => $month]);
+    }
     
     $monthly_revenue[] = [
         'month' => $month_name,
-        'revenue' => $revenue_data['revenue']
+        'revenue' => $revenue
     ];
 }
 
-// Eng faol mijozlar (top 5)
+// Eng faol mijozlar (top 5) - with parameterized query
 $top_customers_query = "
     SELECT 
         c.ad_name,
@@ -65,13 +142,16 @@ $top_customers_query = "
     LEFT JOIN bookings b ON c.id = b.customer_id
     LEFT JOIN payments p ON c.id = p.customer_id
     WHERE c.is_active = 1
-    GROUP BY c.id
+    GROUP BY c.id, c.ad_name, c.phone
     ORDER BY total_ads DESC
     LIMIT 5
 ";
 $top_customers = $conn->query($top_customers_query);
+if (!$top_customers) {
+    log_statistics_issue('Failed to fetch top customers', ['error' => $conn->error]);
+}
 
-// Paketlar bo'yicha statistika
+// Paketlar bo'yicha statistika - with parameterized query and logging
 $packages_stats_query = "
     SELECT 
         p.name,
@@ -81,24 +161,60 @@ $packages_stats_query = "
     FROM packages p
     LEFT JOIN customer_packages cp ON p.id = cp.package_id
     WHERE p.is_active = 1
-    GROUP BY p.id
+    GROUP BY p.id, p.name
     ORDER BY total_sold DESC
 ";
 $packages_stats = $conn->query($packages_stats_query);
+if (!$packages_stats) {
+    log_statistics_issue('Failed to fetch packages stats', ['error' => $conn->error]);
+}
 
-// To'lov usullari statistikasi
+// To'lov usullari statistikasi - with parameterized query
+// Consider both payment_date and created_at for consistency with other queries
 $payment_methods_query = "
     SELECT 
         payment_method,
         COUNT(*) as count,
         SUM(amount) as total
     FROM payments
-    WHERE payment_date BETWEEN '$date_from' AND '$date_to'
+    WHERE (payment_date BETWEEN ? AND ?) 
+       OR (DATE(created_at) BETWEEN ? AND ?)
     GROUP BY payment_method
 ";
-$payment_methods = $conn->query($payment_methods_query);
+$stmt = $conn->prepare($payment_methods_query);
+if (!$stmt) {
+    log_statistics_issue('Failed to prepare payment methods query', ['error' => $conn->error]);
+}
+$stmt->bind_param('ssss', $date_from, $date_to, $date_from, $date_to);
+$stmt->execute();
+$payment_methods = $stmt->get_result();
 
-// Reklama holati statistikasi
+// Check for inconsistent data
+$total_by_method = 0;
+$temp_methods = [];
+while ($row = $payment_methods->fetch_assoc()) {
+    $total_by_method += $row['total'];
+    $temp_methods[] = $row;
+    
+    // Log if payment method is missing or invalid
+    if (empty($row['payment_method'])) {
+        log_statistics_issue('Payment with empty payment_method', ['count' => $row['count'], 'total' => $row['total']]);
+    }
+}
+
+// Check if total by methods matches overall total revenue
+if (abs($total_by_method - ($stats['total_revenue'] ?? 0)) > 0.01) {
+    log_statistics_issue('Revenue mismatch between methods and total', [
+        'total_by_methods' => $total_by_method,
+        'total_revenue' => $stats['total_revenue']
+    ]);
+}
+
+// Reset result for later use in the page
+$payment_methods = $temp_methods;
+$stmt->close();
+
+// Reklama holati statistikasi - with logging
 $ads_status_query = "
     SELECT 
         status,
@@ -107,6 +223,17 @@ $ads_status_query = "
     GROUP BY status
 ";
 $ads_status = $conn->query($ads_status_query);
+if (!$ads_status) {
+    log_statistics_issue('Failed to fetch ads status', ['error' => $conn->error]);
+}
+
+// Log statistics summary
+log_statistics_issue('Statistics page loaded successfully', [
+    'date_from' => $date_from,
+    'date_to' => $date_to,
+    'total_revenue' => $stats['total_revenue'] ?? 0,
+    'total_payments' => $stats['total_payments'] ?? 0
+]);
 
 $page_title = 'Statistika';
 include '../components/header.php';
@@ -509,9 +636,8 @@ include '../components/header.php';
         data: {
             labels: [
                 <?php 
-                $payment_methods->data_seek(0);
                 $labels = [];
-                while($row = $payment_methods->fetch_assoc()) {
+                foreach($payment_methods as $row) {
                     $method_map = [
                         'naqd' => 'Naqd',
                         'karta' => 'Karta',
@@ -527,9 +653,8 @@ include '../components/header.php';
                 label: 'So\'m',
                 data: [
                     <?php 
-                    $payment_methods->data_seek(0);
                     $data = [];
-                    while($row = $payment_methods->fetch_assoc()) {
+                    foreach($payment_methods as $row) {
                         $data[] = $row['total'];
                     }
                     echo implode(',', $data);

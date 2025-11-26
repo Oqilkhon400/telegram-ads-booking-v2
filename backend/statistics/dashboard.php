@@ -73,23 +73,34 @@ try {
     $payments_result = $conn->query($payments_query);
     $payments_stats = $payments_result->fetch_assoc();
     
-    // Bugungi to'lovlar
-    $today_payments = $conn->query("
+    // Bugungi to'lovlar - Consider both payment_date and created_at
+    $today_payments_query = "
         SELECT 
             COUNT(*) as count,
             SUM(amount) as amount
         FROM payments 
-        WHERE DATE(payment_date) = '$today'
-    ")->fetch_assoc();
+        WHERE DATE(payment_date) = ? OR DATE(created_at) = ?
+    ";
+    $stmt = $conn->prepare($today_payments_query);
+    $stmt->bind_param('ss', $today, $today);
+    $stmt->execute();
+    $today_payments = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
     
-    // Shu oy to'lovlar
-    $month_payments = $conn->query("
+    // Shu oy to'lovlar - Consider both payment_date and created_at
+    $month_payments_query = "
         SELECT 
             COUNT(*) as count,
             SUM(amount) as amount
         FROM payments 
-        WHERE DATE_FORMAT(payment_date, '%Y-%m') = '$this_month'
-    ")->fetch_assoc();
+        WHERE DATE_FORMAT(payment_date, '%Y-%m') = ? 
+           OR DATE_FORMAT(created_at, '%Y-%m') = ?
+    ";
+    $stmt = $conn->prepare($month_payments_query);
+    $stmt->bind_param('ss', $this_month, $this_month);
+    $stmt->execute();
+    $month_payments = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
     
     // To'lov turlari bo'yicha
     $payment_methods = $conn->query("
@@ -164,17 +175,18 @@ try {
         ];
     }
     
-    // Oxirgi 5 ta to'lov
+    // Oxirgi 5 ta to'lov - Align with statistics page, consider both payment_date and created_at
     $recent_payments = $conn->query("
         SELECT 
             p.id,
             p.amount,
             p.payment_method,
             p.payment_date,
+            p.created_at,
             c.ad_name as customer_name
         FROM payments p
         JOIN customers c ON p.customer_id = c.id
-        ORDER BY p.payment_date DESC
+        ORDER BY COALESCE(p.payment_date, DATE(p.created_at)) DESC, p.created_at DESC
         LIMIT 5
     ");
     
@@ -185,7 +197,7 @@ try {
             'customer_name' => $payment['customer_name'],
             'amount' => format_money($payment['amount']),
             'method' => $payment['payment_method'],
-            'date' => format_datetime($payment['payment_date'])
+            'date' => format_datetime($payment['payment_date'] ?: $payment['created_at'])
         ];
     }
     
