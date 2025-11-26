@@ -73,13 +73,14 @@ try {
     $payments_result = $conn->query($payments_query);
     $payments_stats = $payments_result->fetch_assoc();
     
-    // Bugungi to'lovlar - Consider both payment_date and created_at
+    // Bugungi to'lovlar - Prioritize payment_date, fallback to created_at
     $today_payments_query = "
         SELECT 
             COUNT(*) as count,
             SUM(amount) as amount
         FROM payments 
-        WHERE DATE(payment_date) = ? OR DATE(created_at) = ?
+        WHERE payment_date = ? 
+           OR (payment_date IS NULL AND DATE(created_at) = ?)
     ";
     $stmt = $conn->prepare($today_payments_query);
     $stmt->bind_param('ss', $today, $today);
@@ -87,14 +88,14 @@ try {
     $today_payments = $stmt->get_result()->fetch_assoc();
     $stmt->close();
     
-    // Shu oy to'lovlar - Consider both payment_date and created_at
+    // Shu oy to'lovlar - Prioritize payment_date, fallback to created_at
     $month_payments_query = "
         SELECT 
             COUNT(*) as count,
             SUM(amount) as amount
         FROM payments 
         WHERE DATE_FORMAT(payment_date, '%Y-%m') = ? 
-           OR DATE_FORMAT(created_at, '%Y-%m') = ?
+           OR (payment_date IS NULL AND DATE_FORMAT(created_at, '%Y-%m') = ?)
     ";
     $stmt = $conn->prepare($month_payments_query);
     $stmt->bind_param('ss', $this_month, $this_month);
