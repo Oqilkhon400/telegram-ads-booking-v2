@@ -21,6 +21,9 @@ function log_statistics_issue($message, $data = []) {
     error_log($log_message);
 }
 
+// Revenue mismatch tolerance threshold
+define('REVENUE_MISMATCH_TOLERANCE', 0.01);
+
 // Sana filtrlari with validation
 $date_from = isset($_GET['date_from']) ? $_GET['date_from'] : date('Y-m-01');
 $date_to = isset($_GET['date_to']) ? $_GET['date_to'] : date('Y-m-d');
@@ -136,9 +139,9 @@ if (!$stmt) {
         
         $revenue = isset($revenue_by_month[$month]) ? $revenue_by_month[$month] : 0;
         
-        // Log if missing revenue data for a month
+        // Note: Zero revenue is logged for informational purposes, not necessarily an error
         if ($revenue == 0) {
-            log_statistics_issue('Zero revenue for month', ['month' => $month]);
+            log_statistics_issue('Zero revenue for month (informational)', ['month' => $month]);
         }
         
         $monthly_revenue[] = [
@@ -221,7 +224,7 @@ if (!$stmt) {
     }
     
     // Check if total by methods matches overall total revenue
-    if (abs($total_by_method - ($stats['total_revenue'] ?? 0)) > 0.01) {
+    if (abs($total_by_method - ($stats['total_revenue'] ?? 0)) > REVENUE_MISMATCH_TOLERANCE) {
         log_statistics_issue('Revenue mismatch between methods and total', [
             'total_by_methods' => $total_by_method,
             'total_revenue' => $stats['total_revenue']
@@ -241,9 +244,16 @@ $ads_status_query = "
     FROM bookings
     GROUP BY status
 ";
-$ads_status = $conn->query($ads_status_query);
-if (!$ads_status) {
+$ads_status_result = $conn->query($ads_status_query);
+if (!$ads_status_result) {
     log_statistics_issue('Failed to fetch ads status', ['error' => $conn->error]);
+    $ads_status = [];
+} else {
+    // Store in array for consistency with payment_methods
+    $ads_status = [];
+    while ($row = $ads_status_result->fetch_assoc()) {
+        $ads_status[] = $row;
+    }
 }
 
 // Log statistics summary
@@ -599,9 +609,8 @@ include '../components/header.php';
         data: {
             labels: [
                 <?php 
-                $ads_status->data_seek(0);
                 $labels = [];
-                while($row = $ads_status->fetch_assoc()) {
+                foreach($ads_status as $row) {
                     $status_map = [
                         'scheduled' => 'Rejalashtirilgan',
                         'published' => 'Chop etilgan',
@@ -615,9 +624,8 @@ include '../components/header.php';
             datasets: [{
                 data: [
                     <?php 
-                    $ads_status->data_seek(0);
                     $data = [];
-                    while($row = $ads_status->fetch_assoc()) {
+                    foreach($ads_status as $row) {
                         $data[] = $row['count'];
                     }
                     echo implode(',', $data);
